@@ -1,0 +1,15 @@
+{
+  "name": "shotmatrix",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cross-browser, cross-device screenshots of any URL, from the terminal.",
+  "bin": { "shotmatrix": "./shot.mjs" },
+  "scripts": {
+    "shot": "node shot.mjs",
+    "browsers": "playwright install chromium firefox webkit"
+  },
+  "dependencies": {
+    "playwright": "^1.62.1"
+  }
+}

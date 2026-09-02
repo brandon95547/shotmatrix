@@ -1,0 +1,3 @@
+node_modules/
+# Output lives in ../screenshots by default and is not source.
+screenshots/
