@@ -1,3 +1,4 @@
 node_modules/
-# Output lives in ../screenshots by default and is not source.
+
+# Runs land in ../screenshots by default — outside this repo, and not source.
 screenshots/
