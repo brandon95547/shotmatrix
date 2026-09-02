@@ -22,9 +22,21 @@
 //
 // These are Playwright's own builds, not the copies installed on this Mac. That is the
 // point — they are pinned and reproducible — but it does mean the WebKit here is not
-// byte-identical to the Safari in your dock, and on macOS 14 Playwright ships a frozen
-// WebKit that no longer tracks Safari releases. Treat WebKit cells as "the engine says",
-// not "Safari 18.4 says".
+// byte-identical to the Safari in your dock. Treat WebKit cells as "the engine says", not
+// "Safari says".
+//
+// PLAYWRIGHT IS PINNED TO 1.55.0 AND UPGRADING IT BREAKS WEBKIT ON macOS 14.
+//
+// From 1.56 or so, Playwright stopped building WebKit for macOS 14 and falls back to a
+// frozen `webkit_mac14_special` build — while its client keeps talking the newer protocol.
+// The two no longer agree, and every WebKit page dies at newPage() with
+//
+//   Protocol error (Page.overrideSetting): Unknown setting: PushAPIEnabled
+//
+// which is a third of the matrix gone. 1.55.0 ships a real WebKit 26.0, matching current
+// Safari — so the pin is not settling for something older, it is the version that actually
+// works here. Upgrading is safe again once this Mac is on macOS 15+; check by running the
+// matrix with --browsers webkit before you trust it.
 
 import { chromium, firefox, webkit } from 'playwright';
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -169,18 +181,32 @@ async function shootOne(browser, engineKey, vp, { url, outDir, scheme, fullPage,
   // actually keys on, so the cell is worth having; it just cannot tell you about
   // hover-vs-touch behaviour.
   const canEmulateMobile = engineKey !== 'firefox';
-  const ctx = await browser.newContext({
-    viewport: { width: vp.width, height: vp.height },
-    deviceScaleFactor: vp.dpr,
-    colorScheme: scheme,
-    reducedMotion: 'reduce',
-    ...(vp.mobile && canEmulateMobile
-      ? { isMobile: true, hasTouch: true, userAgent: MOBILE_UA[engineKey] }
-      : {}),
-  });
-  const page = await ctx.newPage();
   const files = [];
   const problems = [];
+
+  // Opening the context and the page is INSIDE the try, and that is not defensive habit —
+  // it is what this got wrong first time out. A WebKit/Playwright protocol mismatch threw
+  // at newPage(), and because that line sat outside the guard it took down a run that had
+  // already produced sixteen good screenshots. A cell that cannot render is one failed
+  // cell, reported in the sheet; it is never the whole matrix.
+  let ctx;
+  let page;
+  try {
+    ctx = await browser.newContext({
+      viewport: { width: vp.width, height: vp.height },
+      deviceScaleFactor: vp.dpr,
+      colorScheme: scheme,
+      reducedMotion: 'reduce',
+      ...(vp.mobile && canEmulateMobile
+        ? { isMobile: true, hasTouch: true, userAgent: MOBILE_UA[engineKey] }
+        : {}),
+    });
+    page = await ctx.newPage();
+  } catch (err) {
+    await ctx?.close().catch(() => {});
+    return { ok: false, files, error: `context: ${err.message.split('\n')[0]}`, problems };
+  }
+
   page.on('pageerror', (err) => problems.push(`page error: ${err.message}`));
   page.on('requestfailed', (req) => {
     // Not every failed request matters, but a missing stylesheet or image is exactly the
@@ -323,7 +349,25 @@ async function main() {
   let done = 0;
   let failed = 0;
   for (const engineKey of args.engines) {
-    const browser = await ENGINES[engineKey].launcher.launch();
+    let browser;
+    try {
+      browser = await ENGINES[engineKey].launcher.launch();
+    } catch (err) {
+      // An engine that will not start is an engine's worth of failed cells, recorded and
+      // moved past — not the end of the run. Missing browser binaries land here, and the
+      // message says which command fixes it.
+      const why = err.message.split('\n')[0];
+      for (const scheme of schemes) {
+        for (const vp of picked) {
+          done += 1;
+          failed += 1;
+          rows.push({ ok: false, files: [], error: `launch: ${why}`, problems: [], engine: engineKey, vp, scheme });
+        }
+      }
+      console.log(`  ${engineKey}: could not launch — ${why}`);
+      console.log('    (try: npx playwright install ' + engineKey + ')');
+      continue;
+    }
     try {
       for (const scheme of schemes) {
         for (const vp of picked) {

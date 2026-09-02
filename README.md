@@ -29,11 +29,26 @@ The cells that are not real products — Firefox at iPhone width, say — are st
 having. They tell you whether a layout is width-driven or engine-driven, which is the first
 thing you want to know when only one of them looks wrong.
 
-**Two honest caveats.** These are Playwright's own pinned builds, not the browsers installed
-on this Mac; that is what makes runs reproducible, but it means WebKit here is not
-byte-identical to the Safari in your dock. And on macOS 14 Playwright ships a *frozen*
-WebKit that no longer tracks Safari releases — read those cells as "the engine says", not
-"Safari 18 says". Upgrading macOS gets you a current one.
+**One honest caveat.** These are Playwright's own pinned builds, not the browsers installed
+on this Mac. That is what makes runs reproducible, but it means WebKit here is not
+byte-identical to the Safari in your dock — read those cells as "the engine says", not
+"Safari says".
+
+### Do not upgrade Playwright past 1.55.0 on macOS 14
+
+Later versions stopped building WebKit for macOS 14 and fall back to a frozen
+`webkit_mac14_special` build, while the client keeps speaking the newer protocol. They no
+longer agree, and every WebKit page dies at `newPage()` with:
+
+```
+Protocol error (Page.overrideSetting): Unknown setting: PushAPIEnabled
+```
+
+That is a third of the matrix, and it fails *after* Chromium and Firefox have already
+succeeded, so a run looks like it worked until you count the files. 1.55.0 ships a real
+WebKit 26.0 matching current Safari, so the pin is not settling for something older — it is
+the version that works here. Upgrading is safe again on macOS 15+; verify with
+`--browsers webkit` before trusting it.
 
 ## Viewports
 
