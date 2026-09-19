@@ -11,7 +11,7 @@ container is managed by the systemd unit in this folder. nginx exposes it at
 | Unit | `/etc/systemd/system/shotmatrix.service`, a copy of `deploy/shotmatrix.service` |
 | Container | `shotmatrix`, published on `127.0.0.1:4700` only |
 | Runs | Docker volume `shotmatrix_runs`, emptied on every start |
-| nginx | the `/api/shotmatrix/` locations and the two `limit_req_zone`s in `/etc/nginx/conf.d/skylanex.com.conf`. The skylanex repo keeps the snapshot, at `deploy/nginx/skylanex.com.conf` |
+| nginx | the `/api/shotmatrix/` locations and the three `limit_req_zone`s in `/etc/nginx/conf.d/skylanex.com.conf`. That file exists only on the server, with no copy in any repo; edit it there |
 
 ## Deploy a change
 

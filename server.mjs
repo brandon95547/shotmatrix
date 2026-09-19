@@ -13,9 +13,9 @@
 //      a short queue, a deadline per page and per run, and a height cap on full-page shots.
 //
 // nginx sits in front and adds its own request-rate limits, so a flood is turned away
-// before it reaches Node — the rules are in the skylanex repo's vhost,
-// deploy/nginx/skylanex.com.conf. Everything is served under BASE_PATH so the paths here
-// are the public ones, and nginx passes them through unchanged.
+// before it reaches Node — the rules are in skylanex.com's vhost on the prod box,
+// /etc/nginx/conf.d/skylanex.com.conf. Everything is served under BASE_PATH so the paths
+// here are the public ones, and nginx passes them through unchanged.
 //
 // API (all under BASE_PATH, default /api/shotmatrix):
 //   GET  /health                 liveness, and how busy it is
