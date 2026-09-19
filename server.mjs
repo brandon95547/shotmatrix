@@ -4,13 +4,18 @@
 //   node server.mjs              (in prod: the Docker container, under systemd)
 //
 // The same matrix as the terminal tool, rendered by the same code (lib/matrix.mjs), with
-// the three things a public version needs on top:
+// the four things a public version needs on top:
 //
 //   1. The browsers only ever reach the public internet — lib/guard.mjs.
-//   2. Starting a run costs the caller a proof of work — lib/pow.mjs.
-//   3. Hard limits on everything a stranger could otherwise turn into load: one run at a
-//      time across the whole service, one per visitor, an hourly and a daily allowance,
-//      a short queue, a deadline per page and per run, and a height cap on full-page shots.
+//   2. Every run belongs to a signed-in account. nginx asks phansora's app whether the
+//      visitor is signed in (auth_request) and passes the account id as X-Shotmatrix-User;
+//      nothing but nginx can reach this port, and nginx overwrites whatever a visitor sent.
+//      A run is visible to the account that started it and to no one else.
+//   3. Starting a run costs the caller a proof of work — lib/pow.mjs.
+//   4. Hard limits on everything a caller could otherwise turn into load: one run at a
+//      time across the whole service, one per account, hourly and daily allowances per
+//      account AND per address, a short queue, a deadline per page and per run, and a
+//      height cap on full-page shots.
 //
 // nginx sits in front and adds its own request-rate limits, so a flood is turned away
 // before it reaches Node — the rules are in skylanex.com's vhost on the prod box,
@@ -21,11 +26,13 @@
 //   GET  /health                 liveness, and how busy it is
 //   GET  /challenge              a proof-of-work challenge
 //   POST /jobs                   { url, engines, viewports, token, nonce } → { id }
-//   GET  /jobs/:id               progress and results
-//   GET  /runs/:id/:file         one screenshot
+//   GET  /jobs/:id               progress, and a summary of what each cell found
 //   GET  /runs/:id/zip           every screenshot of a finished run, as one download
 //
-// Runs are deleted an hour after they finish, and nothing about them outlives a restart.
+// NOTHING IS KEPT. The screenshots exist only in DATA_DIR, which in prod is a tmpfs — RAM,
+// never the disk — and only until they are handed over: the zip is a one-time download,
+// and the run is deleted the moment it has been sent in full. A run nobody downloads is
+// deleted RUN_TTL_MIN (10) minutes after it finishes, and nothing outlives a restart.
 
 import http from 'node:http';
 import net from 'node:net';
@@ -33,7 +40,6 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdir, rm, stat, writeFile, statfs } from 'node:fs/promises';
-import { createReadStream } from 'node:fs';
 import { ENGINES, VIEWPORTS, shootOne } from './lib/matrix.mjs';
 import { parseTarget, resolvePublic, startProxy, guardContext, BLOCKED_HEADER } from './lib/guard.mjs';
 import { createPow } from './lib/pow.mjs';
@@ -52,9 +58,13 @@ const CONFIG = {
   trustProxy: env.TRUST_PROXY === '1',
   powBits: num(env.POW_BITS, 16),
   queueMax: num(env.QUEUE_MAX, 6),
+  // Off only for local work without nginx in front: everyone is then one 'local' account.
+  requireLogin: env.REQUIRE_LOGIN !== '0',
   perIpHour: num(env.PER_IP_HOUR, 6),
   perIpDay: num(env.PER_IP_DAY, 20),
-  runTtlMs: num(env.RUN_TTL_MIN, 60) * 60_000,
+  perUserHour: num(env.PER_USER_HOUR, 6),
+  perUserDay: num(env.PER_USER_DAY, 20),
+  runTtlMs: num(env.RUN_TTL_MIN, 10) * 60_000,
   reuseMs: num(env.REUSE_MIN, 10) * 60_000,
   navTimeoutMs: num(env.NAV_TIMEOUT_S, 25) * 1000,
   cellTimeoutMs: num(env.CELL_TIMEOUT_S, 60) * 1000,
@@ -79,7 +89,7 @@ const log = (...parts) => console.log(new Date().toISOString(), ...parts);
 const jobs = new Map(); // id → job
 const waiting = []; // job ids, first in first out
 let active = null;
-const starts = new Map(); // ip → timestamps of runs it started, for the allowances
+const starts = new Map(); // 'ip:…' / 'user:…' → timestamps of runs it started, for the allowances
 
 const pow = createPow({ bits: CONFIG.powBits });
 
@@ -115,6 +125,30 @@ function clientIp(req) {
   return req.socket.remoteAddress || 'unknown';
 }
 
+// The signed-in account, as nginx vouched for it — or null. An id is digits and nothing
+// else, so a header that is anything more is not one nginx wrote.
+function userOf(req) {
+  const user = String(req.headers['x-shotmatrix-user'] || '').trim();
+  if (/^\d{1,19}$/.test(user)) return user;
+  return CONFIG.requireLogin ? null : 'local';
+}
+
+// A run, if it is the caller's. Someone else's run answers exactly as a missing one does,
+// so an id tells a stranger nothing — not even that it exists.
+function ownJob(req, id) {
+  const job = jobs.get(id);
+  return job && job.user === userOf(req) ? job : null;
+}
+
+// The run and its files, gone. Called once the zip has been handed over, when a run fails
+// with nothing to hand over, and by the sweep for runs nobody came back for.
+async function forget(id, why) {
+  const job = jobs.get(id);
+  jobs.delete(id);
+  await rm(runDir(id), { recursive: true, force: true }).catch(() => {});
+  if (job) log('deleted', id, why);
+}
+
 async function readJson(req, limit = 8192) {
   const chunks = [];
   let size = 0;
@@ -137,17 +171,20 @@ function pickList(value, known) {
 }
 
 // ── allowances ──────────────────────────────────────────────────────────────
-function allowance(ip, now = Date.now()) {
-  const times = (starts.get(ip) || []).filter((t) => now - t < 86_400_000);
-  starts.set(ip, times);
+// Counted twice — per account, and per address — and the first one spent answers. The
+// account is the real unit now that every run has one; the address still counts because
+// making a second account is free and a script can make twenty.
+function allowance(key, perHour, perDay, now = Date.now()) {
+  const times = (starts.get(key) || []).filter((t) => now - t < 86_400_000);
+  starts.set(key, times);
   const lastHour = times.filter((t) => now - t < 3_600_000);
-  if (lastHour.length >= CONFIG.perIpHour) {
+  if (lastHour.length >= perHour) {
     const wait = Math.ceil((lastHour[0] + 3_600_000 - now) / 60_000);
-    return { message: `That’s ${CONFIG.perIpHour} runs this hour — the limit that keeps this free for everyone. Try again in ${wait} minute${wait === 1 ? '' : 's'}.`, retryAfter: wait * 60 };
+    return { message: `That’s ${perHour} runs this hour — the limit that keeps this free for everyone. Try again in ${wait} minute${wait === 1 ? '' : 's'}.`, retryAfter: wait * 60 };
   }
-  if (times.length >= CONFIG.perIpDay) {
+  if (times.length >= perDay) {
     const wait = Math.ceil((times[0] + 86_400_000 - now) / 3_600_000);
-    return { message: `That’s ${CONFIG.perIpDay} runs today, which is the daily limit. It resets in about ${wait} hour${wait === 1 ? '' : 's'}.`, retryAfter: wait * 3600 };
+    return { message: `That’s ${perDay} runs today, which is the daily limit. It resets in about ${wait} hour${wait === 1 ? '' : 's'}.`, retryAfter: wait * 3600 };
   }
   return null;
 }
@@ -160,6 +197,8 @@ async function diskIsLow() {
 }
 
 // ── routes ──────────────────────────────────────────────────────────────────
+const GONE = 'That run is gone. Screenshots are deleted once they’re downloaded, or 10 minutes after the run finishes.';
+
 async function route(req, res) {
   const { pathname } = new URL(req.url, 'http://localhost');
   if (!pathname.startsWith(`${CONFIG.base}/`)) return send(res, 404, { error: 'Not found.' });
@@ -174,14 +213,14 @@ async function route(req, res) {
     const { token, salt, bits } = pow.issue();
     return send(res, 200, { token, salt, bits });
   }
+  // Everything past here is a run, and a run needs an account.
+  if (!userOf(req)) return send(res, 401, { error: 'Log in to use Shot Matrix.', code: 'login' });
+
   if (req.method === 'POST' && p === '/jobs') return createJob(req, res);
   if (get && (m = /^\/jobs\/([\w-]{22})$/.exec(p))) {
-    const job = jobs.get(m[1]);
-    if (!job) return send(res, 404, { error: 'That run has expired. Runs are kept for an hour.', code: 'gone' });
+    const job = ownJob(req, m[1]);
+    if (!job) return send(res, 404, { error: GONE, code: 'gone' });
     return send(res, 200, publicJob(job));
-  }
-  if (get && (m = /^\/runs\/([\w-]{22})\/([a-z0-9-]+__[a-z]+__(?:fold\.jpg|full\.png))$/.exec(p))) {
-    return sendShot(req, res, m[1], m[2]);
   }
   if (get && (m = /^\/runs\/([\w-]{22})\/zip$/.exec(p))) return sendZip(req, res, m[1]);
   return send(res, 404, { error: 'Not found.' });
@@ -189,6 +228,7 @@ async function route(req, res) {
 
 async function createJob(req, res) {
   const ip = clientIp(req);
+  const user = userOf(req);
   if (!String(req.headers['content-type'] || '').startsWith('application/json')) {
     return send(res, 415, { error: 'Send the request as JSON.' });
   }
@@ -220,26 +260,27 @@ async function createJob(req, res) {
     });
   }
 
-  // The same visitor asking for the same page and matrix again soon after: hand back that
-  // run rather than render it twice. Only ever their OWN run. Handing one visitor's run
-  // to another would tell them that somebody captured that exact address recently, and
-  // show it to them, which matters when the address carries a token.
+  // The same account asking for the same page and matrix again, while its last run of it
+  // is still waiting to be downloaded: hand back that run rather than render it twice.
+  // Only ever their OWN run — handing one account's run to another would show them that
+  // somebody captured that exact address, which matters when the address carries a token.
   const key = `${target.url}|${engines}|${viewports}`;
   const now = Date.now();
   for (const job of jobs.values()) {
-    if (job.key === key && job.ip === ip && job.state !== 'failed' && now - job.createdAt < CONFIG.reuseMs) {
+    if (job.key === key && job.user === user && job.state !== 'failed' && now - job.createdAt < CONFIG.reuseMs) {
       return send(res, 200, { id: job.id, reused: true });
     }
   }
 
-  // One at a time per visitor. The id comes back so the page can reattach to it.
+  // One at a time per account. The id comes back so the page can reattach to it.
   for (const job of jobs.values()) {
-    if (job.ip === ip && (job.state === 'queued' || job.state === 'running')) {
+    if (job.user === user && (job.state === 'queued' || job.state === 'running')) {
       return send(res, 429, { error: 'You already have a run going — it’s below.', code: 'yours', id: job.id });
     }
   }
 
-  const over = allowance(ip, now);
+  const over = allowance(`user:${user}`, CONFIG.perUserHour, CONFIG.perUserDay, now)
+    || allowance(`ip:${ip}`, CONFIG.perIpHour, CONFIG.perIpDay, now);
   if (over) return send(res, 429, { error: over.message, code: 'allowance' }, { 'Retry-After': String(over.retryAfter) });
 
   if (waiting.length >= CONFIG.queueMax || await diskIsLow()) {
@@ -257,6 +298,7 @@ async function createJob(req, res) {
     id: newId(),
     key,
     ip,
+    user,
     url: target.url,
     host: target.host,
     engines,
@@ -270,8 +312,9 @@ async function createJob(req, res) {
   };
   jobs.set(job.id, job);
   waiting.push(job.id);
-  starts.get(ip).push(now);
-  log('queued', job.id, job.host, `${engines.length}x${viewports.length}`, `ip:${ipTag(ip)}`, `ahead:${waiting.length - 1 + (active ? 1 : 0)}`);
+  starts.get(`user:${user}`).push(now);
+  starts.get(`ip:${ip}`).push(now);
+  log('queued', job.id, job.host, `${engines.length}x${viewports.length}`, `user:${user}`, `ip:${ipTag(ip)}`, `ahead:${waiting.length - 1 + (active ? 1 : 0)}`);
   pump();
   return send(res, 202, { id: job.id, reused: false });
 }
@@ -305,8 +348,6 @@ function publicCell(c) {
     engine: c.engine,
     viewport: c.viewport,
     state: c.state,
-    fold: c.fold || null,
-    full: c.full || null,
     status: c.status ?? null,
     width: c.size?.w ?? null,
     height: c.size?.h ?? null,
@@ -318,28 +359,9 @@ function publicCell(c) {
   };
 }
 
-async function sendShot(req, res, id, name) {
-  const job = jobs.get(id);
-  if (!job) return send(res, 404, { error: 'That run has expired.', code: 'gone' });
-  const file = path.join(runDir(id), name);
-  let info;
-  try { info = await stat(file); } catch { return send(res, 404, { error: 'Not found.' }); }
-  res.writeHead(200, {
-    ...COMMON_HEADERS,
-    'Content-Type': name.endsWith('.jpg') ? 'image/jpeg' : 'image/png',
-    'Content-Length': info.size,
-    // Private: a screenshot of someone's page is theirs, not a shared cache's. Immutable:
-    // a file in a run never changes after it is written.
-    'Cache-Control': 'private, max-age=3600, immutable',
-    'Content-Disposition': `inline; filename="${job.host}-${name}"`,
-  });
-  if (req.method === 'HEAD') return res.end();
-  createReadStream(file).pipe(res);
-}
-
 async function sendZip(req, res, id) {
-  const job = jobs.get(id);
-  if (!job) return send(res, 404, { error: 'That run has expired.', code: 'gone' });
+  const job = ownJob(req, id);
+  if (!job) return send(res, 404, { error: GONE, code: 'gone' });
   if (job.state !== 'done') return send(res, 409, { error: 'That run hasn’t finished yet.' });
   const folder = `shotmatrix-${job.host}`;
   const entries = [];
@@ -366,8 +388,14 @@ async function sendZip(req, res, id) {
     'Content-Disposition': `attachment; filename="${folder}.zip"`,
   });
   if (req.method === 'HEAD') return res.end();
+  // Handed over in full, then gone: the zip is the only copy there is, and it is theirs.
+  // 'finish' means every byte left for the visitor (nginx does not buffer this route); a
+  // download cut off part-way leaves the run in place to try again until it expires.
+  res.once('finish', () => { forget(id, 'downloaded'); });
+  const aborter = new AbortController();
+  res.once('close', () => { if (!res.writableFinished) aborter.abort(); });
   try {
-    await writeZip(res, entries, new Date(job.finishedAt || Date.now()));
+    await writeZip(res, entries, new Date(job.finishedAt || Date.now()), aborter.signal);
     res.end();
   } catch (err) {
     log('zip failed', id, err.message);
@@ -572,6 +600,9 @@ function pump() {
       job.finishedAt = Date.now();
       const ok = job.cells.filter((c) => c.state === 'done').length;
       log('finished', job.id, job.host, job.state, `${ok}/${job.cells.length}`, `${((job.finishedAt - job.startedAt) / 1000).toFixed(1)}s`);
+      // Nothing rendered means nothing to download; the record stays for the page to read
+      // why, and the sweep takes it with the rest.
+      if (job.state === 'failed') rm(runDir(job.id), { recursive: true, force: true }).catch(() => {});
       active = null;
       setImmediate(pump);
     });
@@ -581,14 +612,11 @@ function pump() {
 async function sweep() {
   const now = Date.now();
   for (const [id, job] of jobs) {
-    if (job.finishedAt && now - job.finishedAt > CONFIG.runTtlMs) {
-      jobs.delete(id);
-      await rm(runDir(id), { recursive: true, force: true }).catch(() => {});
-    }
+    if (job.finishedAt && now - job.finishedAt > CONFIG.runTtlMs) await forget(id, 'expired');
   }
-  for (const [ip, times] of starts) {
+  for (const [key, times] of starts) {
     const recent = times.filter((t) => now - t < 86_400_000);
-    if (recent.length) starts.set(ip, recent); else starts.delete(ip);
+    if (recent.length) starts.set(key, recent); else starts.delete(key);
   }
   pow.prune(now);
 }

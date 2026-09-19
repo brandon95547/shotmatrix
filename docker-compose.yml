@@ -21,11 +21,17 @@ services:
       - "127.0.0.1:4700:4700"   # nginx only — never published on a public interface
     environment:
       TRUST_PROXY: "1"          # X-Real-IP comes from nginx, the only thing that can connect
-    volumes:
-      - runs:/data
+      # /data is RAM, so "free space" is what is left of its 512m. A run needs well under
+      # 150m; below that, new runs wait rather than fail half-written.
+      MIN_FREE_MB: "150"
     read_only: true
+    # Screenshots never touch the disk. /data is where runs are written, and it is a
+    # tmpfs: a run lives there only until its zip is downloaded (or 10 minutes pass), and
+    # a restart takes everything with it. It counts against mem_limit, which has room for
+    # it beside three browsers. pwuser is 1001:1001 in Playwright's image.
     tmpfs:
       - /tmp:size=1g
+      - /data:size=512m,mode=0700,uid=1001,gid=1001
     shm_size: 1gb
     mem_limit: 3g
     memswap_limit: 3g
@@ -42,9 +48,6 @@ services:
       options:
         max-size: 10m
         max-file: "3"
-
-volumes:
-  runs:
 
 networks:
   egress: {}

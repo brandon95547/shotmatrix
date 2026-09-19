@@ -125,20 +125,31 @@ This matters on the prod box: the Phansora API listens on `0.0.0.0:8000`, and wi
 the proxy a container could reach it through its bridge gateway. Redirects need no
 special case, because the redirected request goes through the proxy too.
 
-**Starting a run costs a proof of work** (`lib/pow.mjs`). The page solves a 16-bit
+**Every run needs an account.** skylanex.com signs people in against Phansora's accounts
+(email or Google). nginx asks Phansora's app whether the visitor is signed in
+(`auth_request`) and passes the account id to the service as `X-Shotmatrix-User`,
+overwriting anything the visitor sent. A run is visible only to the account that started
+it; anyone else gets the same 404 as a run that never existed. `REQUIRE_LOGIN=0` turns
+this off for local work, and everyone is then one `local` account.
+
+**Starting a run also costs a proof of work** (`lib/pow.mjs`). The page solves a 16-bit
 SHA-256 puzzle while the visitor pastes their address. That takes about 60ms in a
-normal browser and about 4 seconds in one running JavaScript with the JIT off. There's
-no account, no third-party script and nothing to click. It filters out anything that
-doesn't run JavaScript. It won't stop a determined attacker; the limits below do that.
+normal browser and about 4 seconds in one running JavaScript with the JIT off. It filters
+out anything that doesn't run JavaScript. It won't stop a determined attacker; the limits
+below do that.
+
+**Nothing is kept.** The result is a zip, downloaded once: the run is deleted the moment
+the zip has been sent in full, and a run nobody downloads is deleted 10 minutes after it
+finishes. In prod the runs live on a tmpfs, so a screenshot never touches the disk.
 
 **Limits:**
 
-- one run at a time across the whole service, and one per visitor
-- 6 runs an hour and 20 a day per visitor
+- one run at a time across the whole service, and one per account
+- 6 runs an hour and 20 a day per account, and the same again per address
 - a queue of 6
 - 25s to load each page, 60s per cell, 5 minutes per run
 - full-page shots cut at 10,000px
-- runs deleted an hour after they finish
+- runs deleted once downloaded, or 10 minutes after they finish
 
 nginx adds request-rate limits in front, so a flood never reaches Node.
 
@@ -148,15 +159,16 @@ paint past 16,384 device pixels anyway. The terminal tool keeps the real ratios.
 
 ```bash
 npm run serve                  # http://127.0.0.1:4700/api/shotmatrix/
-npm run smoke -- https://example.com
+npm run smoke -- --user 1 https://example.com   # downloads the zip, so the run is gone after
 npm test                       # guard, proof of work, zip
 npm run test:browsers          # all three engines against a loopback server (slow)
 ```
 
 Settings are environment variables, and the defaults are the prod values. `PORT`,
-`HOST`, `BASE_PATH`, `DATA_DIR`, `TRUST_PROXY`, `POW_BITS`, `QUEUE_MAX`, `PER_IP_HOUR`,
-`PER_IP_DAY`, `RUN_TTL_MIN`, `NAV_TIMEOUT_S`, `CELL_TIMEOUT_S`, `JOB_DEADLINE_S` and
-`MAX_HEIGHT` are all read at the top of `server.mjs`.
+`HOST`, `BASE_PATH`, `DATA_DIR`, `TRUST_PROXY`, `REQUIRE_LOGIN`, `POW_BITS`, `QUEUE_MAX`,
+`PER_IP_HOUR`, `PER_IP_DAY`, `PER_USER_HOUR`, `PER_USER_DAY`, `RUN_TTL_MIN`,
+`NAV_TIMEOUT_S`, `CELL_TIMEOUT_S`, `JOB_DEADLINE_S`, `MIN_FREE_MB` and `MAX_HEIGHT` are
+all read at the top of `server.mjs`.
 
 In prod it runs in Docker, on Playwright's own image pinned to the same 1.55.0 as
 `package.json`, under a systemd unit. See [deploy/README.md](deploy/README.md).
