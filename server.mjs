@@ -35,7 +35,7 @@ import path from 'node:path';
 import { mkdir, rm, stat, writeFile, statfs } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import { ENGINES, VIEWPORTS, shootOne } from './lib/matrix.mjs';
-import { parseTarget, resolvePublic, startProxy, guardContext } from './lib/guard.mjs';
+import { parseTarget, resolvePublic, startProxy, guardContext, BLOCKED_HEADER } from './lib/guard.mjs';
 import { createPow } from './lib/pow.mjs';
 import { zipSize, writeZip } from './lib/zip.mjs';
 
@@ -82,7 +82,6 @@ let active = null;
 const starts = new Map(); // ip → timestamps of runs it started, for the allowances
 
 const pow = createPow({ bits: CONFIG.powBits });
-let proxy;
 
 const newId = () => crypto.randomBytes(16).toString('base64url'); // 22 chars
 const runDir = (id) => path.join(RUNS, id);
@@ -373,8 +372,8 @@ async function sendZip(req, res, id) {
 // Every browser is launched pointing at the guard proxy, with the few engine switches
 // that would otherwise let a page go around it: QUIC is UDP and cannot be proxied, and
 // WebRTC opens UDP straight to whatever address a page names.
-function launchOptions(engineKey) {
-  const base = { proxy: { server: proxy.server }, timeout: 30000 };
+function launchOptions(engineKey, proxyServer) {
+  const base = { proxy: { server: proxyServer }, timeout: 30000 };
   if (engineKey === 'chromium') {
     return { ...base, args: ['--disable-quic', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp'] };
   }
@@ -400,27 +399,36 @@ function friendly(message) {
   if (!message) return null;
   if (/timed out|Timeout \d+ms exceeded/i.test(message)) return 'Timed out waiting for the page.';
   if (/NAME_NOT_RESOLVED|UNKNOWN_HOST|Could not resolve/i.test(message)) return 'Couldn’t find that site.';
-  if (/TUNNEL_CONNECTION_FAILED|BLOCKED_BY_CLIENT|blockedbyclient|PROXY|403/i.test(message)) return 'Blocked: the page led somewhere this tool won’t go.';
+  if (message === 'blocked') return 'Blocked: the page led to a private address, which this tool won’t visit.';
+  if (/TUNNEL_CONNECTION_FAILED|BLOCKED_BY_CLIENT|blockedbyclient|PROXY/i.test(message)) return 'Blocked: the page led somewhere this tool won’t go.';
   if (/CONNECTION_REFUSED|ECONNREFUSED|Could not connect/i.test(message)) return 'The site refused the connection.';
   if (/CERT|SSL|certificate|SEC_ERROR|INADEQUATE_SECURITY/i.test(message)) return 'The site’s HTTPS certificate wasn’t accepted.';
   if (/launch|Executable doesn't exist/i.test(message)) return 'That browser is unavailable right now.';
   return 'The page couldn’t be captured.';
 }
 
-async function launch(engineKey) {
-  return ENGINES[engineKey].launcher.launch(launchOptions(engineKey));
+async function launch(engineKey, proxyServer) {
+  return ENGINES[engineKey].launcher.launch(launchOptions(engineKey, proxyServer));
 }
 
 const TRANSIENT = /timed out|Timeout \d+ms exceeded|CONNECTION_RESET|EMPTY_RESPONSE|NET_RESET|NET_INTERRUPT|ECONNRESET|socket hang up/i;
 
 // One cell, under its own deadline: the smaller of the per-page budget and whatever the
 // run has left.
-async function shoot(browser, engineKey, vp, url, dir, deadline) {
+//
+// `seen` is this engine's tally of proxy refusals, and a cell whose page was refused is
+// reported as blocked. Two signs, because engines take a refusal differently: Chromium
+// and WebKit render the proxy's 403 (so the page's own response carries the header), and
+// Firefox swaps in an error page of its own that cannot be captured at all.
+async function shoot(browser, engineKey, vp, url, dir, deadline, seen) {
   const aborter = new AbortController();
   const budget = Math.max(5000, Math.min(CONFIG.cellTimeoutMs, deadline - Date.now()));
   const timer = setTimeout(() => aborter.abort(), budget);
+  const blocksBefore = seen.blocks;
+  let pageBlocked = false;
+  const blocked = (r) => ({ ...r, ok: false, files: [], error: 'blocked' });
   try {
-    return await shootOne(browser, engineKey, vp, {
+    const r = await shootOne(browser, engineKey, vp, {
       url,
       outDir: dir,
       scheme: 'light',
@@ -438,9 +446,18 @@ async function shoot(browser, engineKey, vp, url, dir, deadline) {
       maxWidth: CONFIG.maxWidth,
       foldFormat: 'jpeg',
       contextOptions: { serviceWorkers: 'block', acceptDownloads: false },
-      prepareContext: guardContext,
+      prepareContext: async (ctx) => {
+        await guardContext(ctx);
+        ctx.on('response', (res) => {
+          try {
+            if (res.headers()[BLOCKED_HEADER] && !res.frame().parentFrame()) pageBlocked = true;
+          } catch { /* a response from a frame already gone */ }
+        });
+      },
       signal: aborter.signal,
     });
+    if (pageBlocked || (!r.ok && seen.blocks > blocksBefore)) return blocked(r);
+    return r;
   } catch (err) {
     return { ok: false, files: [], error: err.message, problems: [] };
   } finally {
@@ -450,10 +467,17 @@ async function shoot(browser, engineKey, vp, url, dir, deadline) {
 
 async function runEngine(job, engineKey, dir, deadline) {
   const cells = job.cells.filter((c) => c.engine === engineKey);
+  // This engine's own proxy, so its refusals are its own (see shoot()).
+  const seen = { blocks: 0 };
+  const proxy = await startProxy({
+    log: (what, why, host) => log(what, why, host, engineKey, job.id),
+    onBlock: () => { seen.blocks += 1; },
+  });
   let browser;
-  try { browser = await launch(engineKey); } catch (err) {
+  try { browser = await launch(engineKey, proxy.server); } catch (err) {
     log('launch failed', engineKey, err.message.split('\n')[0]);
     for (const c of cells) Object.assign(c, { state: 'failed', error: 'That browser is unavailable right now.' });
+    await proxy.close();
     return;
   }
   try {
@@ -464,7 +488,7 @@ async function runEngine(job, engineKey, dir, deadline) {
       }
       if (!browser.isConnected()) {
         // A crashed browser takes every later cell with it unless it is replaced.
-        try { browser = await launch(engineKey); } catch {
+        try { browser = await launch(engineKey, proxy.server); } catch {
           Object.assign(cell, { state: 'failed', error: 'That browser is unavailable right now.' });
           continue;
         }
@@ -472,14 +496,14 @@ async function runEngine(job, engineKey, dir, deadline) {
       cell.state = 'running';
       const vp = VIEWPORTS.find((v) => v.key === cell.viewport);
       const started = Date.now();
-      let r = await shoot(browser, engineKey, vp, job.url, dir, deadline);
+      let r = await shoot(browser, engineKey, vp, job.url, dir, deadline, seen);
       // One more try for a cell that timed out or lost its connection — but only once some
       // other cell has rendered, which says the site is up and this was a blip. A site
       // that is down times out everywhere, and retrying it would only double the wait.
       if (!r.ok && TRANSIENT.test(r.error) && deadline - Date.now() > 20_000
         && job.cells.some((c) => c.state === 'done')) {
         log('retrying', job.id, engineKey, vp.key);
-        r = await shoot(browser, engineKey, vp, job.url, dir, deadline);
+        r = await shoot(browser, engineKey, vp, job.url, dir, deadline, seen);
       }
       const names = r.files.map((f) => path.basename(f));
       Object.assign(cell, {
@@ -497,6 +521,7 @@ async function runEngine(job, engineKey, dir, deadline) {
     }
   } finally {
     await browser.close().catch(() => {});
+    await proxy.close();
   }
 }
 
@@ -567,7 +592,6 @@ async function main() {
   // can be reached any more.
   await rm(RUNS, { recursive: true, force: true });
   await mkdir(RUNS, { recursive: true });
-  proxy = await startProxy({ log: (what, why, host) => log(what, why, host) });
 
   const server = http.createServer((req, res) => {
     route(req, res).catch((err) => {
@@ -579,7 +603,7 @@ async function main() {
   server.requestTimeout = 30_000;
   server.headersTimeout = 10_000;
   server.listen(CONFIG.port, CONFIG.host, () => {
-    log(`shotmatrix listening on http://${CONFIG.host}:${CONFIG.port}${CONFIG.base}/ (guard ${proxy.server}, pow ${CONFIG.powBits} bits)`);
+    log(`shotmatrix listening on http://${CONFIG.host}:${CONFIG.port}${CONFIG.base}/ (pow ${CONFIG.powBits} bits)`);
   });
   setInterval(() => { sweep().catch((err) => log('sweep failed', err.message)); }, 60_000).unref();
 

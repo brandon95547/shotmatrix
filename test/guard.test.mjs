@@ -114,3 +114,20 @@ test('the proxy does let the public web through (needs internet)', async (t) => 
   assert.equal(await viaProxy(proxyPort, 'http://example.com/'), 200);
   assert.match(await connectVia(proxyPort, 'example.com:443'), /^HTTP\/1\.1 200/);
 });
+
+test('a refusal is marked, and reported to whoever started the proxy', async (t) => {
+  const refused = [];
+  const proxy = await startProxy({ onBlock: (reason, host) => refused.push(`${reason} ${host}`) });
+  t.after(() => proxy.close());
+  const proxyPort = Number(new URL(proxy.server).port);
+  const res = await new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port: proxyPort, path: 'http://169.254.169.254/latest/meta-data/', headers: { host: '169.254.169.254' } });
+    req.on('response', (r) => { r.resume(); resolve(r); });
+    req.on('error', reject);
+    req.end();
+  });
+  assert.equal(res.statusCode, 403);
+  assert.equal(res.headers['x-shotmatrix-blocked'], 'private');
+  await connectVia(proxyPort, 'localtest.me:443');
+  assert.deepEqual(refused, ['private 169.254.169.254', 'private localtest.me']);
+});
