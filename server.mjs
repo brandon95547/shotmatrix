@@ -293,21 +293,28 @@ function publicJob(job) {
     finishedAt: job.finishedAt,
     expiresAt: job.finishedAt ? job.finishedAt + CONFIG.runTtlMs : null,
     maxHeight: CONFIG.maxHeight,
-    cells: job.cells.map((c) => ({
-      engine: c.engine,
-      viewport: c.viewport,
-      state: c.state,
-      fold: c.fold || null,
-      full: c.full || null,
-      status: c.status ?? null,
-      width: c.size?.w ?? null,
-      height: c.size?.h ?? null,
-      overflows: Boolean(c.size?.overflows),
-      truncated: Boolean(c.truncated),
-      problems: c.problems ? c.problems.length : 0,
-      problemList: c.problems ? c.problems.slice(0, 6) : [],
-      error: c.error || null,
-    })),
+    cells: job.cells.map((c) => publicCell(c)),
+  };
+}
+
+// The status code has its own field, and the page its own badge for it, so it is left
+// out of the problem list here. report.json in the zip keeps everything.
+function publicCell(c) {
+  const problems = (c.problems || []).filter((p) => !/^HTTP \d{3}$/.test(p));
+  return {
+    engine: c.engine,
+    viewport: c.viewport,
+    state: c.state,
+    fold: c.fold || null,
+    full: c.full || null,
+    status: c.status ?? null,
+    width: c.size?.w ?? null,
+    height: c.size?.h ?? null,
+    overflows: Boolean(c.size?.overflows),
+    truncated: Boolean(c.truncated),
+    problems: problems.length,
+    problemList: problems.slice(0, 6),
+    error: c.error || null,
   };
 }
 
