@@ -50,7 +50,7 @@ const CONFIG = {
   // Only honour X-Real-IP when nginx is the only thing that can reach this port — in
   // prod it is published on 127.0.0.1 alone. Off, every caller is the socket's address.
   trustProxy: env.TRUST_PROXY === '1',
-  powBits: num(env.POW_BITS, 18),
+  powBits: num(env.POW_BITS, 16),
   queueMax: num(env.QUEUE_MAX, 6),
   perIpHour: num(env.PER_IP_HOUR, 6),
   perIpDay: num(env.PER_IP_DAY, 20),

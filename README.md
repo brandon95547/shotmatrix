@@ -125,12 +125,11 @@ This matters on the prod box: the Phansora API listens on `0.0.0.0:8000`, and wi
 the proxy a container could reach it through its bridge gateway. Redirects need no
 special case, because the redirected request goes through the proxy too.
 
-**Starting a run costs a proof of work** (`lib/pow.mjs`). The page solves an 18-bit
-SHA-256 puzzle (about a quarter of a second on a laptop) while the visitor pastes their
-address. There's no account, no
-third-party script and nothing to click. It filters out anything that doesn't run
-JavaScript and makes volume expensive. It won't stop a determined attacker; the limits
-below do that.
+**Starting a run costs a proof of work** (`lib/pow.mjs`). The page solves a 16-bit
+SHA-256 puzzle while the visitor pastes their address. That takes about 60ms in a
+normal browser and about 4 seconds in one running JavaScript with the JIT off. There's
+no account, no third-party script and nothing to click. It filters out anything that
+doesn't run JavaScript. It won't stop a determined attacker; the limits below do that.
 
 **Limits:**
 
