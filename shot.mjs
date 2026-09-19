@@ -6,19 +6,8 @@
 // Renders the page in three ENGINES (Chromium, Firefox, WebKit) at several VIEWPORTS
 // (desktop through phone) and writes a PNG per combination plus an HTML contact sheet.
 //
-// WHAT "ALL MAJOR BROWSERS" HONESTLY MEANS HERE. There are only three engines worth
-// testing, and every browser you can name is one of them:
-//
-//   Chromium  →  Chrome, Edge, Opera, Brave, Samsung Internet, Android WebView
-//   Firefox   →  Firefox, and nothing else
-//   WebKit    →  Safari on macOS, and EVERY browser on iOS — Chrome and Firefox on an
-//                iPhone are WebKit with a different toolbar, because Apple requires it
-//
-// So a Chromium shot at phone width IS Chrome on Android, and a WebKit shot at phone
-// width IS Safari on iPhone — and also Chrome on iPhone. The cells that are not real
-// products (Firefox at iPhone width) are still worth having: they tell you whether a
-// layout is width-driven or engine-driven, which is the first thing you want to know
-// when only one of them looks wrong.
+// What "all major browsers" honestly means, and the matrix itself, live in lib/matrix.mjs,
+// which the web service (server.mjs) renders from too.
 //
 // These are Playwright's own builds, not the copies installed on this Mac. That is the
 // point — they are pinned and reproducible — but it does mean the WebKit here is not
@@ -38,39 +27,9 @@
 // works here. Upgrading is safe again once this Mac is on macOS 15+; check by running the
 // matrix with --browsers webkit before you trust it.
 
-import { chromium, firefox, webkit } from 'playwright';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-
-// ── the matrix ──────────────────────────────────────────────────────────────
-const ENGINES = {
-  chromium: { launcher: chromium, label: 'Chromium', stands_for: 'Chrome · Edge · Brave · Android' },
-  firefox: { launcher: firefox, label: 'Firefox', stands_for: 'Firefox' },
-  webkit: { launcher: webkit, label: 'WebKit', stands_for: 'Safari · every iOS browser' },
-};
-
-// Sizes people actually have, not a tidy series. The phone widths are the three that
-// between them cover most of the market; 360 is the narrow Android floor that breaks
-// layouts, and it is the one worth looking at first.
-const VIEWPORTS = [
-  { key: 'desktop-1920', label: 'Desktop 1920', width: 1920, height: 1080, dpr: 1, mobile: false },
-  { key: 'laptop-1440', label: 'Laptop 1440', width: 1440, height: 900, dpr: 2, mobile: false },
-  { key: 'laptop-1280', label: 'Laptop 1280', width: 1280, height: 800, dpr: 2, mobile: false },
-  { key: 'tablet-landscape', label: 'Tablet landscape 1024', width: 1024, height: 768, dpr: 2, mobile: true },
-  { key: 'tablet-portrait', label: 'Tablet portrait 820', width: 820, height: 1180, dpr: 2, mobile: true },
-  { key: 'phone-large', label: 'Phone large 430', width: 430, height: 932, dpr: 3, mobile: true },
-  { key: 'phone-390', label: 'Phone 390', width: 390, height: 844, dpr: 3, mobile: true },
-  { key: 'phone-small', label: 'Phone small 360', width: 360, height: 740, dpr: 3, mobile: true },
-];
-
-// A phone-shaped context needs a phone user agent as well as a phone viewport: plenty of
-// sites branch on the UA string for their menu, and a desktop UA at 390px is a case that
-// exists nowhere in the world. Firefox is absent because Playwright cannot emulate mobile
-// in it at all — see the note where these are applied.
-const MOBILE_UA = {
-  chromium: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36',
-  webkit: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
-};
+import { ENGINES, VIEWPORTS, shootOne } from './lib/matrix.mjs';
 
 // ── arguments ───────────────────────────────────────────────────────────────
 function parseArgs(argv) {
@@ -129,126 +88,6 @@ Examples
   node shot.mjs https://www.skylanex.com/ --browsers webkit --viewports phone-390
   node shot.mjs https://www.skylanex.com/ --both-schemes --dismiss "#cookie-accept"
 `;
-
-// ── page preparation ────────────────────────────────────────────────────────
-// A screenshot is only useful if it is the same picture twice. Three things stop that:
-// fonts arriving late, images that only load when scrolled to, and anything animated.
-async function settlePage(page, { settle, dismiss }) {
-  if (dismiss) {
-    // Explicit and opt-in. Nothing is auto-clicked: a script that presses buttons on a
-    // page by guesswork will eventually press the wrong one.
-    try { await page.locator(dismiss).first().click({ timeout: 3000 }); } catch { /* not there */ }
-  }
-
-  // Walk the page so lazy images and scroll-triggered sections actually load, then come
-  // back. Stepped rather than jumped, because an IntersectionObserver that never sees an
-  // element intersect will never fire.
-  await page.evaluate(async () => {
-    const step = Math.round(window.innerHeight * 0.8);
-    for (let y = 0; y < document.body.scrollHeight; y += step) {
-      window.scrollTo(0, y);
-      await new Promise((r) => setTimeout(r, 90));
-    }
-    window.scrollTo(0, 0);
-    await new Promise((r) => setTimeout(r, 150));
-  });
-
-  // Fonts, because a shot taken mid-swap shows the fallback face and every text metric
-  // in it is wrong.
-  try { await page.evaluate(() => document.fonts?.ready); } catch { /* no font API */ }
-
-  // Freeze motion LAST, so anything that had to animate in has already done so. Without
-  // this, two runs of the same page differ by wherever the carousel happened to be.
-  await page.addStyleTag({
-    content: `*, *::before, *::after {
-      animation-play-state: paused !important;
-      animation-delay: -1ms !important;
-      animation-duration: 1ms !important;
-      transition-duration: 0ms !important;
-      transition-delay: 0ms !important;
-      scroll-behavior: auto !important;
-      caret-color: transparent !important;
-    }`,
-  });
-
-  if (settle) await page.waitForTimeout(settle);
-}
-
-// ── one cell of the matrix ──────────────────────────────────────────────────
-async function shootOne(browser, engineKey, vp, { url, outDir, scheme, fullPage, fold, dismiss, timeout, settle }) {
-  // isMobile and hasTouch throw on Firefox — Playwright does not implement mobile
-  // emulation there. Firefox still gets the WIDTH, which is what most responsive CSS
-  // actually keys on, so the cell is worth having; it just cannot tell you about
-  // hover-vs-touch behaviour.
-  const canEmulateMobile = engineKey !== 'firefox';
-  const files = [];
-  const problems = [];
-
-  // Opening the context and the page is INSIDE the try, and that is not defensive habit —
-  // it is what this got wrong first time out. A WebKit/Playwright protocol mismatch threw
-  // at newPage(), and because that line sat outside the guard it took down a run that had
-  // already produced sixteen good screenshots. A cell that cannot render is one failed
-  // cell, reported in the sheet; it is never the whole matrix.
-  let ctx;
-  let page;
-  try {
-    ctx = await browser.newContext({
-      viewport: { width: vp.width, height: vp.height },
-      deviceScaleFactor: vp.dpr,
-      colorScheme: scheme,
-      reducedMotion: 'reduce',
-      ...(vp.mobile && canEmulateMobile
-        ? { isMobile: true, hasTouch: true, userAgent: MOBILE_UA[engineKey] }
-        : {}),
-    });
-    page = await ctx.newPage();
-  } catch (err) {
-    await ctx?.close().catch(() => {});
-    return { ok: false, files, error: `context: ${err.message.split('\n')[0]}`, problems };
-  }
-
-  page.on('pageerror', (err) => problems.push(`page error: ${err.message}`));
-  page.on('requestfailed', (req) => {
-    // Not every failed request matters, but a missing stylesheet or image is exactly the
-    // kind of thing a screenshot is taken to catch, and it is invisible in the picture.
-    const kind = req.resourceType();
-    if (kind === 'stylesheet' || kind === 'image' || kind === 'font' || kind === 'script') {
-      problems.push(`${kind} failed: ${req.url().slice(0, 120)}`);
-    }
-  });
-
-  try {
-    const res = await page.goto(url, { waitUntil: 'load', timeout });
-    const status = res?.status() ?? 0;
-    if (status >= 400) problems.push(`HTTP ${status}`);
-    // 'networkidle' as a NUDGE, not a requirement: a site with a poll or a live chat
-    // widget never goes idle, and waiting for it would hang every run.
-    await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-    await settlePage(page, { settle, dismiss });
-
-    const base = `${vp.key}__${engineKey}${scheme === 'dark' ? '__dark' : ''}`;
-    if (fold) {
-      const f = path.join(outDir, `${base}__fold.png`);
-      await page.screenshot({ path: f, fullPage: false });
-      files.push(f);
-    }
-    if (fullPage) {
-      const f = path.join(outDir, `${base}__full.png`);
-      await page.screenshot({ path: f, fullPage: true });
-      files.push(f);
-    }
-    const size = await page.evaluate(() => ({
-      w: document.documentElement.scrollWidth,
-      h: document.documentElement.scrollHeight,
-      overflows: document.documentElement.scrollWidth > window.innerWidth + 1,
-    }));
-    return { ok: true, files, status, size, problems };
-  } catch (err) {
-    return { ok: false, files, error: err.message, problems };
-  } finally {
-    await ctx.close().catch(() => {});
-  }
-}
 
 // ── contact sheet ───────────────────────────────────────────────────────────
 // Twenty-four PNGs in a folder is not a thing anyone can compare. Grouped by VIEWPORT
