@@ -110,3 +110,54 @@ Node 18+ and the browser engines, which are about 400 MB:
 npm install
 npx playwright install chromium firefox webkit
 ```
+
+## The web service
+
+`server.mjs` is the same matrix behind an HTTP API, for the free tool at
+**https://www.skylanex.com/products/shot-matrix**. It renders with the same code as the
+terminal tool (`lib/matrix.mjs`), with three additions a public version needs.
+
+**The browsers only reach the public internet** (`lib/guard.mjs`). Every connection the
+three engines make goes through a forward proxy inside the service, which resolves the
+name itself, refuses it unless *every* address is public, and connects to that exact
+address, so there is no second DNS answer to rebind. Only ports 80 and 443 are allowed.
+This matters on the prod box: the Phansora API listens on `0.0.0.0:8000`, and without
+the proxy a container could reach it through its bridge gateway. Redirects need no
+special case, because the redirected request goes through the proxy too.
+
+**Starting a run costs a proof of work** (`lib/pow.mjs`). The page solves an 18-bit
+SHA-256 puzzle (about a quarter of a second on a laptop) while the visitor pastes their
+address. There's no account, no
+third-party script and nothing to click. It filters out anything that doesn't run
+JavaScript and makes volume expensive. It won't stop a determined attacker; the limits
+below do that.
+
+**Limits:**
+
+- one run at a time across the whole service, and one per visitor
+- 6 runs an hour and 20 a day per visitor
+- a queue of 6
+- 25s to load each page, 60s per cell, 5 minutes per run
+- full-page shots cut at 10,000px
+- runs deleted an hour after they finish
+
+nginx adds request-rate limits in front, so a flood never reaches Node.
+
+The service renders at 1x rather than each device's real pixel ratio. The layout is the
+same in CSS pixels, and a 3x full-page phone shot is a 30 MB PNG that Chromium cannot
+paint past 16,384 device pixels anyway. The terminal tool keeps the real ratios.
+
+```bash
+npm run serve                  # http://127.0.0.1:4700/api/shotmatrix/
+npm run smoke -- https://example.com
+npm test                       # guard, proof of work, zip
+npm run test:browsers          # all three engines against a loopback server (slow)
+```
+
+Settings are environment variables, and the defaults are the prod values. `PORT`,
+`HOST`, `BASE_PATH`, `DATA_DIR`, `TRUST_PROXY`, `POW_BITS`, `QUEUE_MAX`, `PER_IP_HOUR`,
+`PER_IP_DAY`, `RUN_TTL_MIN`, `NAV_TIMEOUT_S`, `CELL_TIMEOUT_S`, `JOB_DEADLINE_S` and
+`MAX_HEIGHT` are all read at the top of `server.mjs`.
+
+In prod it runs in Docker, on Playwright's own image pinned to the same 1.55.0 as
+`package.json`, under a systemd unit. See [deploy/README.md](deploy/README.md).

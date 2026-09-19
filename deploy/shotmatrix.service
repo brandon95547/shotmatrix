@@ -1,0 +1,31 @@
+# /etc/systemd/system/shotmatrix.service — Shot Matrix screenshot service.
+#
+# Install:  cp deploy/shotmatrix.service /etc/systemd/system/ && systemctl daemon-reload
+#           systemctl enable --now shotmatrix
+# Deploy:   cd /var/www/shotmatrix && git pull --ff-only && systemctl restart shotmatrix
+#
+# Runs `docker compose up` in the foreground rather than detached, so systemd tracks the
+# container itself: it restarts it if it dies, and its output lands in the journal.
+[Unit]
+Description=Shot Matrix screenshot service (Docker, 127.0.0.1:4700)
+Documentation=https://github.com/brandon95547/shotmatrix
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/www/shotmatrix
+# Rebuild on every start. Unchanged layers are cached, so this is seconds; the long start
+# timeout is for the first build, which pulls the ~2GB Playwright image.
+ExecStartPre=/usr/bin/docker compose build
+ExecStart=/usr/bin/docker compose up --no-log-prefix --abort-on-container-exit
+ExecStop=/usr/bin/docker compose down
+Restart=always
+RestartSec=5
+TimeoutStartSec=900
+TimeoutStopSec=30
+SyslogIdentifier=shotmatrix
+
+[Install]
+WantedBy=multi-user.target

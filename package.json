@@ -3,12 +3,16 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Cross-browser, cross-device screenshots of any URL, from the terminal.",
+  "description": "Cross-browser, cross-device screenshots of any URL, from the terminal or as a web service.",
   "bin": {
     "shotmatrix": "./shot.mjs"
   },
   "scripts": {
     "shot": "node shot.mjs",
+    "serve": "node server.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "test": "node --test test/guard.test.mjs test/pow-zip.test.mjs",
+    "test:browsers": "node --test test/browsers.test.mjs",
     "browsers": "playwright install chromium firefox webkit"
   },
   "dependencies": {

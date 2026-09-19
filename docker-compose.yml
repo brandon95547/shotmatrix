@@ -1,0 +1,50 @@
+# Shot Matrix — the service behind https://www.skylanex.com/products/shot-matrix.
+#
+# Started by systemd (deploy/shotmatrix.service), not by hand, so it comes back after a
+# reboot and its log is in the journal:
+#
+#   systemctl restart shotmatrix     # also rebuilds, so a git pull + this is a deploy
+#   journalctl -u shotmatrix -f
+#
+# The container is the sandbox around three browsers that load whatever a stranger
+# types, so it gets as little as it can work with: no capabilities, no privilege
+# escalation, a read-only filesystem, and memory, CPU and process ceilings well inside
+# what the box can spare next to the Phansora API and its model.
+services:
+  shotmatrix:
+    build: .
+    image: shotmatrix:local
+    container_name: shotmatrix
+    init: true                  # reaps the browsers' child processes
+    restart: "no"               # systemd is the supervisor, not Docker
+    ports:
+      - "127.0.0.1:4700:4700"   # nginx only — never published on a public interface
+    environment:
+      TRUST_PROXY: "1"          # X-Real-IP comes from nginx, the only thing that can connect
+    volumes:
+      - runs:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g
+    shm_size: 1gb
+    mem_limit: 3g
+    memswap_limit: 3g
+    cpus: 6
+    pids_limit: 4096
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    # Its own bridge, not phansora's: nothing else runs on it, so there is no neighbouring
+    # container to reach even before the guard proxy refuses private addresses.
+    networks: [egress]
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  runs:
+
+networks:
+  egress: {}

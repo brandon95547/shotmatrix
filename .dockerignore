@@ -1,0 +1,7 @@
+node_modules
+screenshots
+.git
+test
+scripts
+deploy
+*.md
